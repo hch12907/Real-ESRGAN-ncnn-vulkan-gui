@@ -1,18 +1,18 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![feature(windows_process_extensions_async_pipes)]
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::fs;
-use std::io;
-use std::io::BufRead;
-use std::io::BufReader;
-use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Child, Command as Cmd};
 use std::time::Duration;
+use std::{fs, io};
 
-use iced::widget::scrollable;
-use iced::widget::{button, checkbox, column, radio, row, text, text_input, Space};
+use async_std::io::prelude::BufReadExt;
+use async_std::process::{Child, Command as Cmd, ExitStatus};
+use iced::futures::channel::mpsc;
+use iced::futures::io::BufReader;
+use iced::futures::sink::SinkExt;
+use iced::widget::{button, checkbox, column, radio, row, scrollable, text, text_input, Space};
 use iced::window::Settings as WindowSettings;
 use iced::{
     executor, theme, Alignment, Application, Color, Command, Element, Length, Settings,
@@ -53,7 +53,9 @@ struct RealEsrgan {
     format: Format,
     filename_format: String,
 
+    checker: Option<mpsc::Sender<CheckerTask>>,
     log: VecDeque<String>,
+    processing: bool,
 
     state: RealEsrganState,
 }
@@ -62,7 +64,6 @@ struct RealEsrgan {
 struct RealEsrganState {
     selected_files: Vec<OsString>,
     output_dir: OsString,
-    children: Vec<Child>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -99,10 +100,40 @@ enum Message {
     OutputNameChanged(String),
     PathChanged { path_type: PathType, path: String },
     StartClicked,
+    CheckerReady(mpsc::Sender<CheckerTask>),
+    ChildUpdate(CheckerResult),
     SwitchPage(Page),
     Tick,
     TTAModeClicked(bool),
     UpscaleRatioSelected(UpscaleRatio),
+}
+
+#[derive(Debug)]
+enum CheckerStatus {
+    Starting,
+    Ready(Vec<Child>, mpsc::Receiver<CheckerTask>),
+}
+
+#[derive(Clone, Debug)]
+enum CheckerResult {
+    Ended,
+    ChildLog(u32, String),        // (pid, message)
+    ChildExited(u32, ExitStatus), // (pid, error_code)
+    ChildErrored(u32, String),    // (pid, error)
+    SpawnError(String),
+}
+
+enum CheckerTask {
+    NewChild {
+        input_path: OsString,
+        output_path: OsString,
+        upscale_ratio: u32,
+        gpu_id: String,
+        model_path: String,
+        model_name: String,
+        tta_mode: bool,
+    },
+    Poll,
 }
 
 impl RealEsrgan {
@@ -373,105 +404,239 @@ impl RealEsrgan {
             output.push(&filename);
             output.set_extension(output_ext);
 
-            let mut realesrgan_command = Cmd::new("./realesrgan-ncnn-vulkan-cli");
-            let mut realesrgan = realesrgan_command
-                .stderr(std::process::Stdio::piped())
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .arg("-i")
-                .arg(f)
-                .arg("-o")
-                .arg(output)
-                .arg("-s")
-                .arg((self.upscale_ratio as u32).to_string());
+            let sent = self
+                .checker
+                .as_mut()
+                .unwrap()
+                .start_send(CheckerTask::NewChild {
+                    input_path: f.clone(),
+                    output_path: output.into_os_string(),
+                    upscale_ratio: self.upscale_ratio as u32,
+                    gpu_id: self.gpu_id.clone(),
+                    model_path: self.model_path.clone(),
+                    model_name: self.model_name.clone(),
+                    tta_mode: self.tta_mode,
+                });
 
-            if !self.gpu_id.is_empty() {
-                realesrgan = realesrgan.arg("-g").arg(&self.gpu_id);
+            if sent.is_err() {
+                let err = sent.unwrap_err().to_string();
+                let err = format!("Unabled to start a background task for RealESRGAN: {}", err);
+                error_dialog(&err);
+                break;
+            } else {
+                self.processing = true;
             }
-
-            if !self.model_path.is_empty() {
-                realesrgan = realesrgan.arg("-m").arg(&self.model_path);
-            }
-
-            if !self.model_name.is_empty() {
-                realesrgan = realesrgan.arg("-n").arg(&self.model_name);
-            }
-
-            if self.tta_mode {
-                realesrgan = realesrgan.arg("-x");
-            }
-
-            let child = match realesrgan.spawn() {
-                Ok(x) => x,
-                Err(e) => {
-                    error_dialog(&format!("Unable to spawn a realesrgan instance:\n{:?}", e));
-                    return;
-                }
-            };
-
-            self.state.children.push(child);
         }
     }
 
-    fn check_children_status(&mut self) {
+    fn children_status_checker() -> Subscription<Message> {
+        struct ChildrenStatusWorker;
+
+        iced::subscription::channel(
+            std::any::TypeId::of::<ChildrenStatusWorker>(),
+            100,
+            |mut output| async move {
+                let mut state = CheckerStatus::Starting;
+
+                loop {
+                    match &mut state {
+                        CheckerStatus::Starting => {
+                            let (sender, receiver) = mpsc::channel(8);
+
+                            // If we fail to deliver even the Ready message, just crash
+                            // and burn.
+                            output.send(Message::CheckerReady(sender)).await.unwrap();
+
+                            state = CheckerStatus::Ready(Vec::new(), receiver);
+                        }
+                        CheckerStatus::Ready(ref mut children, receiver) => {
+                            use iced::futures::StreamExt;
+
+                            let input = receiver.select_next_some().await;
+
+                            match input {
+                                CheckerTask::NewChild {
+                                    input_path,
+                                    output_path,
+                                    upscale_ratio,
+                                    gpu_id,
+                                    model_path,
+                                    model_name,
+                                    tta_mode,
+                                } => {
+                                    let mut child = Cmd::new("./realesrgan-ncnn-vulkan-cli");
+                                    let mut child = child
+                                        .stderr(std::process::Stdio::piped())
+                                        .arg("-i")
+                                        .arg(input_path)
+                                        .arg("-o")
+                                        .arg(output_path)
+                                        .arg("-s")
+                                        .arg(upscale_ratio.to_string());
+
+                                    if !gpu_id.is_empty() {
+                                        child = child.arg("-g").arg(gpu_id);
+                                    }
+
+                                    if !model_path.is_empty() {
+                                        child = child.arg("-m").arg(&model_path);
+                                    }
+
+                                    if !model_name.is_empty() {
+                                        child = child.arg("-n").arg(&model_name);
+                                    }
+
+                                    if tta_mode {
+                                        child = child.arg("-x");
+                                    }
+
+                                    match child.spawn() {
+                                        Ok(c) => children.push(c),
+                                        Err(e) => {
+                                            // TODO: is unwrap() good here?
+                                            output
+                                                .send(Message::ChildUpdate(
+                                                    CheckerResult::SpawnError(e.to_string()),
+                                                ))
+                                                .await
+                                                .unwrap();
+                                        }
+                                    };
+                                }
+                                CheckerTask::Poll => {
+                                    Self::check_children_status(children, &mut output).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        )
+    }
+
+    async fn check_children_status(children: &mut Vec<Child>, output: &mut mpsc::Sender<Message>) {
+        if children.is_empty() {
+            return;
+        }
+
         let mut i = 0;
 
-        let make_log = |buffer: &mut VecDeque<String>, log| {
-            buffer.push_back(log);
+        while i < children.len() {
+            let c = &mut children[i];
 
-            if buffer.len() > 256 {
-                buffer.pop_front();
-            }
-        };
-
-        while i < self.state.children.len() {
-            let c = &mut self.state.children[i];
-
-            let should_remove = match c.try_wait() {
+            let should_remove = match c.try_status() {
                 Ok(None) => {
                     let pid = c.id();
-                    if let Some(stderr) = c.stderr.as_mut().take() {
-                        let mut reader = BufReader::new(stderr.take(128));
-                        let mut log = format!("pid #{}: ", pid);
-                        // Let's not care whether the read succeeds
-                        let _ = reader.read_line(&mut log);
-                        //log.push_str(": still processing");
 
-                        make_log(&mut self.log, log);
+                    if let Some(stderr) = c.stderr.as_mut().take() {
+                        let mut reader = BufReader::new(stderr);
+                        let mut log = String::new();
+                        match reader.read_line(&mut log).await {
+                            Ok(_) => {
+                                // TODO: is unwrap() good here?
+                                output
+                                    .send(Message::ChildUpdate(CheckerResult::ChildLog(pid, log)))
+                                    .await
+                                    .unwrap();
+                            }
+                            Err(_) => (),
+                        }
                     }
                     false
-                },
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        self.show_error_on_start_button(&format!(
-                            "realesrgan returned {}",
-                            status.code().unwrap_or(-1)
-                        ));
-                    } else {
-                        make_log(&mut self.log, format!("pid #{}: complete!", c.id()));
-                    }
+                }
 
+                Ok(Some(status)) => {
+                    // TODO: is unwrap() good here?
+                    output
+                        .send(Message::ChildUpdate(CheckerResult::ChildExited(
+                            c.id(),
+                            status,
+                        )))
+                        .await
+                        .unwrap();
                     true
                 }
-                Err(e) => {
-                    rfd::MessageDialog::new()
-                        .set_title("Error")
-                        .set_level(rfd::MessageLevel::Error)
-                        .set_description(&format!(
-                            "Unexpected error occured while running RealESRGAN: {}",
-                            e
-                        ))
-                        .show();
 
-                    make_log(&mut self.log, format!("pid #{} ERROR: {}", c.id(), e));
+                Err(e) => {
+                    // TODO: is unwrap() good here?
+                    output
+                        .send(Message::ChildUpdate(CheckerResult::ChildErrored(
+                            c.id(),
+                            e.to_string(),
+                        )))
+                        .await
+                        .unwrap();
                     true
                 }
             };
 
             if should_remove {
-                self.state.children.remove(i);
+                children.remove(i);
             } else {
                 i += 1;
+            }
+        }
+
+        if children.is_empty() {
+            // TODO: is unwrap good here?
+            output
+                .send(Message::ChildUpdate(CheckerResult::Ended))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn apply_checker_updates(&mut self, result: CheckerResult) {
+        use CheckerResult::*;
+
+        let make_log = |buffer: &mut VecDeque<String>, log| {
+            buffer.push_back(log);
+
+            if buffer.len() >= 255 {
+                buffer.pop_front();
+            }
+        };
+
+        match result {
+            Ended => {
+                self.processing = false;
+            }
+
+            ChildLog(pid, raw_log) => {
+                let log = format!("pid #{}: {}", pid, raw_log);
+                make_log(&mut self.log, log);
+            }
+
+            ChildExited(pid, exit) => {
+                if !exit.success() {
+                    self.show_error_on_start_button(&format!(
+                        "realesrgan returned {}",
+                        exit.code().unwrap_or(-1)
+                    ));
+                } else {
+                    make_log(&mut self.log, format!("pid #{}: complete!", pid));
+                }
+            }
+
+            ChildErrored(pid, err) => {
+                rfd::MessageDialog::new()
+                    .set_title("Error")
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_description(&format!(
+                        "Unexpected error occured while running RealESRGAN: {}",
+                        err
+                    ))
+                    .show();
+
+                make_log(&mut self.log, format!("pid #{} ERROR: {}", pid, err));
+            }
+
+            SpawnError(err) => {
+                rfd::MessageDialog::new()
+                    .set_title("Error")
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_description(&format!("Unable to spawn a realesrgan instance:\n{}", err))
+                    .show();
             }
         }
     }
@@ -531,6 +696,8 @@ impl Application for RealEsrgan {
                     self.output = self.state.output_dir.to_string_lossy().to_string();
                 }
             }
+            Message::CheckerReady(sender) => self.checker = Some(sender),
+            Message::ChildUpdate(result) => self.apply_checker_updates(result),
             Message::GpuIdChanged(id) => self.gpu_id = id,
             Message::ModelNameChanged(name) => self.model_name = name,
             Message::ModelPathChanged(path) => self.model_path = path,
@@ -548,7 +715,9 @@ impl Application for RealEsrgan {
             },
             Message::StartClicked => self.start(),
             Message::SwitchPage(page) => self.current_page = page,
-            Message::Tick => self.check_children_status(),
+            Message::Tick => {
+                let _ = self.checker.as_mut().unwrap().try_send(CheckerTask::Poll);
+            }
             Message::TTAModeClicked(check) => self.tta_mode = check,
             Message::UpscaleRatioSelected(ratio) => self.upscale_ratio = ratio,
         };
@@ -582,7 +751,7 @@ impl Application for RealEsrgan {
 
         let mut start_button = button(self.start_button_text.as_ref()).width(Length::Fill);
 
-        if self.state.children.is_empty() {
+        if !self.processing {
             start_button = start_button.on_press(Message::StartClicked)
         };
 
@@ -736,7 +905,7 @@ impl Application for RealEsrgan {
                 for log in self.log.iter() {
                     log_screen = log_screen.push(text(log));
                 }
-                
+
                 let scrollable_log = scrollable(row![
                     Space::with_width(16),
                     log_screen.width(Length::Fill),
@@ -753,6 +922,9 @@ impl Application for RealEsrgan {
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        iced::time::every(Duration::from_millis(500)).map(|_| Message::Tick)
+        Subscription::batch([
+            iced::time::every(Duration::from_millis(500)).map(|_| Message::Tick),
+            Self::children_status_checker(),
+        ])
     }
 }
