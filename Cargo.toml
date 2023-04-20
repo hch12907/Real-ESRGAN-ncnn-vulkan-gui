@@ -9,4 +9,9 @@ build = "build.rs"
 [build-dependencies]
 # embed-resource = "1.3"
 
-[dependencies]
+[dependencies.iced]
+version = "^0.9.0"
+features = ["tokio"]
+
+[dependencies.rfd]
+version = "0.11.3"
