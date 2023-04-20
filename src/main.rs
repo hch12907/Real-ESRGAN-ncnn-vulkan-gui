@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
@@ -241,8 +243,8 @@ impl RealEsrgan {
             for fmt in format_parsed {
                 match fmt {
                     Name => output_filename.extend(filename.encode_wide()),
-                    Scale => output_filename.push((b'0' + self.upscale_ratio) as u16),
-                    Model => output_filename.extend(self.model_name.encode_utf16()),
+                    Scale => output_filename.push(b'0' as u16 + ratio as u16),
+                    Model => output_filename.extend(model.encode_utf16()),
                     Other(s) => output_filename.extend(s.encode_utf16()),
                 }
             }
