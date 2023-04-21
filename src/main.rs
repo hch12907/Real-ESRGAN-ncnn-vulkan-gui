@@ -1,5 +1,4 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
-#![feature(windows_process_extensions_async_pipes)]
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
