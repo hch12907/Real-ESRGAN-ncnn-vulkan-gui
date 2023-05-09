@@ -1,5 +1,7 @@
-// extern crate embed_resource;
+#[cfg(target_os = "windows")]
+extern crate embed_resource;
 
 fn main() {
-    // embed_resource::compile("realesrgan-ncnn-vulkan-gui.exe.rc");
+    #[cfg(target_os = "windows")]
+    embed_resource::compile("realesrgan-ncnn-vulkan-gui.exe.rc");
 }
